@@ -1,3 +1,5 @@
+load("@bazel_skylib//lib:collections.bzl", "collections")
+
 # From:
 # https://stackoverflow.com/questions/47192668/idiomatic-retrieval-of-the-bazel-execution-path#
 
@@ -37,19 +39,6 @@ def _bats_test_impl(ctx):
         ["set -e"] +
         ["export TMPDIR=\"$TEST_TMPDIR\""] +
         ["export PATH=\"{bats_bins_path}\":$PATH".format(bats_bins_path = sep.join(path))] +
-        [
-            # First try and expand `$(location ...)`.
-            # Then try for make variables (possibly supplied by toolchains).
-            'export {}="{}"'.format(
-                key,
-                ctx.expand_make_variables(
-                    key,
-                    ctx.expand_location(val, ctx.attr.deps),
-                    {}
-                )
-            )
-            for key, val in ctx.attr.env.items()
-        ] +
         [_test_files(ctx.executable._bats, ctx.files.srcs, ctx.attr)],
     )
     ctx.actions.write(
@@ -97,9 +86,6 @@ def _bats_with_bats_assert_test_impl(ctx):
 _bats_test_attrs = {
     "data": attr.label_list(allow_files = True),
     "deps": attr.label_list(),
-    "env": attr.string_dict(
-        doc = "A list of key-value pairs of environment variables to define",
-    ),
     "bats_args": attr.string_list(
         doc = "List of arguments passed to `bats`",
     ),
@@ -138,10 +124,75 @@ _bats_with_bats_assert_test = rule(
 )
 
 def bats_test(uses_bats_assert = False, **kwargs):
+    """
+    A rule for creating a test target for running one or more `*.bats` test files.
+
+    The rule is implemented as a macro to handle creating the correct rule(s) for running bats
+    tests with the necessary dependencies and environment configuration.
+    Two targets are created internally.
+    An `sh_test` is used for the actual target, this ensures that environment variables will be
+    expanded properly.
+    A custom rule is used to generated the entrypoint and context for the test to run. This
+    target's name is suffixed with `_entrypoint` and is marked as `manual` to not run out of
+    context (ignore wildcards like `*` and `...`).
+
+    Args:
+        uses_bats_assert (str): Whether this test makes use of `bats_assert` (and `bats_support`).
+        **kwargs (dict): Additional keyword arguments that are passed to the underyling targets.
+            These attributes may include:
+            name:       (Required) The name for the underlying `sh_test` target and the custom
+                            internal (suffixed) entrypoint target.
+            srcs:       (Required) The `*.bats` files to be run by this test.
+            data:       (Optional) Files necessary for the test during runtime.
+            deps:       (Optional) Dependency targets for the test.
+            bats_args:  (Optional) Arguments to be passed to the `bats` (bats-core) binary when
+                        running the tests.
+            env:        (Optional) Dictionary of enviroment variables to their set values. Values
+                        are subject to $(location) and "Make variable" substitution. This includes
+                        logic provided via `toolchains`.
+            toolchains: (Optional) Additional providers for extra logic (e.g. `env` substitution).
+            tags:       (Optional) Tags to be set onto underlying rules.
+            *:          (Optional) Any other attributes that apply for `*_test` targets.
+    """
+    name = kwargs.pop("name")
+    srcs = kwargs.pop("srcs")
+    data = kwargs.pop("data", [])
+    deps = kwargs.pop("deps", [])
+    env = kwargs.pop("env", {})
+    bats_args = kwargs.pop("bats_args", [])
+    tags = kwargs.pop("tags", [])
+
     if not uses_bats_assert:
-        _bats_test(**kwargs)
+        _bats_test(
+            name = name + "_entrypoint",
+            srcs = srcs,
+            data = data,
+            deps = deps,
+            bats_args = bats_args,
+            tags = collections.uniq(tags + ["manual"]),
+            **kwargs
+        )
     else:
-        _bats_with_bats_assert_test(**kwargs)
+        _bats_with_bats_assert_test(
+            name = name + "_entrypoint",
+            srcs = srcs,
+            data = data,
+            deps = deps,
+            bats_args = bats_args,
+            tags = collections.uniq(tags + ["manual"]),
+            **kwargs
+        )
+
+    native.sh_test(
+        name = name,
+        srcs = [
+            ":" + name + "_entrypoint",
+        ],
+        data = data + deps,
+        env = env,
+        tags = tags,
+        **kwargs
+    )
 
 # Inspired from `rules_rust`
 def bats_test_suite(name, srcs, **kwargs):
